@@ -209,7 +209,7 @@ class Relay:
         base_url: str | None = None,
         timeout: float = 120.0,
         max_retries: int = _DEFAULT_MAX_RETRIES,
-        observability: bool = True,
+        send_telemetry: bool = True,
         http_client: httpx.Client | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("RELAY_API_KEY", "")
@@ -224,7 +224,7 @@ class Relay:
         self._owns_client = http_client is None
         self._telemetry: TelemetrySink | None = (
             TelemetrySink(self.api_key, self.base_url)
-            if observability and self.api_key
+            if send_telemetry and self.api_key
             else None
         )
 
@@ -585,7 +585,7 @@ class AsyncRelay:
         base_url: str | None = None,
         timeout: float = 120.0,
         max_retries: int = _DEFAULT_MAX_RETRIES,
-        observability: bool = True,
+        send_telemetry: bool = True,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("RELAY_API_KEY", "")
@@ -600,7 +600,7 @@ class AsyncRelay:
         self._owns_client = http_client is None
         self._telemetry: TelemetrySink | None = (
             TelemetrySink(self.api_key, self.base_url)
-            if observability and self.api_key
+            if send_telemetry and self.api_key
             else None
         )
 

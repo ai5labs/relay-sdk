@@ -65,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from relay_ai._errors import RelayError
 
     try:
-        with Relay(api_key=api_key, observability=False) as client:
+        with Relay(api_key=api_key, send_telemetry=False) as client:
             return _dispatch(args, client)
     except RelayError as exc:
         print(f"Error: {exc.message}", file=sys.stderr)
