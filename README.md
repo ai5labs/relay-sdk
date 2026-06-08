@@ -3,13 +3,13 @@
 Official Python SDK for the [Relay AI Gateway](https://relay.ai5labs.com). One key, every model.
 
 ```bash
-pip install ai5labs-relay
+pip install relay-ai-sdk
 ```
 
 With OpenTelemetry:
 
 ```bash
-pip install ai5labs-relay[otel]
+pip install relay-ai-sdk[otel]
 ```
 
 ## Quick start
