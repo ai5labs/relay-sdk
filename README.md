@@ -174,7 +174,7 @@ client = Relay(
     base_url="https://...",       # custom gateway URL
     timeout=120.0,                # request timeout (seconds)
     max_retries=2,                # automatic retries on 429/5xx
-    send_telemetry=True,          # usage analytics (metadata only)
+    observability=True,           # usage analytics (metadata only)
     http_client=httpx.Client(),   # custom httpx client
 )
 ```
@@ -186,7 +186,7 @@ The SDK sends anonymous usage metadata (model, token counts, latency) to improve
 Disable with:
 
 ```python
-client = Relay(send_telemetry=False)
+client = Relay(observability=False)
 ```
 
 ## OpenTelemetry
