@@ -57,6 +57,7 @@ class StreamChunk(BaseModel):
 class ImageResponse(BaseModel):
     images: list[str] = Field(default_factory=list)
     model: str = ""
+    latency_ms: float = 0.0
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -88,6 +89,7 @@ class RouteResponse(BaseModel):
     alternates: list[RouteAlternate] = Field(default_factory=list)
     classified_intent: str = ""
     source: str = ""
+    latency_ms: float = 0.0
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -101,3 +103,5 @@ class BatchResult(BaseModel):
     index: int = 0
     response: Optional[ChatResponse] = None
     error: Optional[str] = None
+    status_code: Optional[int] = None
+    error_code: Optional[str] = None

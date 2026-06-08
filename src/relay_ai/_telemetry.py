@@ -64,42 +64,51 @@ class TelemetrySink:
         self._wake = threading.Event()
         self._closed = False
         self._thread: threading.Thread | None = None
+        self._http = httpx.Client(
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=10.0,
+        )
 
     def emit(self, event: dict[str, Any]) -> None:
         """Record a metadata-only event.  Non-blocking."""
-        if self._closed:
-            return
-        safe = _filter_event(event)
-        if not safe:
-            return
         with self._lock:
+            if self._closed:
+                return
+            safe = _filter_event(event)
+            if not safe:
+                return
             self._buffer.append(safe)
             if len(self._buffer) >= self.FLUSH_BATCH_SIZE:
                 self._wake.set()
-        self._ensure_started()
+            self._ensure_started()
 
     def close(self) -> None:
         """Best-effort final flush, then stop the background thread."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+        try:
+            self._http.close()
+        except Exception:
+            pass
+        atexit.unregister(self.close)
 
     # ------------------------------------------------------------------
 
     def _ensure_started(self) -> None:
-        with self._lock:
-            if self._thread is not None:
-                return
-            self._thread = threading.Thread(
-                target=self._run,
-                daemon=True,
-                name="relay-telemetry",
-            )
-            self._thread.start()
-            atexit.register(self.close)
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="relay-telemetry",
+        )
+        self._thread.start()
+        atexit.register(self.close)
 
     def _run(self) -> None:
         while not self._closed:
@@ -115,11 +124,6 @@ class TelemetrySink:
             batch = list(self._buffer)
             self._buffer.clear()
         try:
-            httpx.post(
-                self._url,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                json={"events": batch},
-                timeout=10.0,
-            )
+            self._http.post(self._url, json={"events": batch})
         except Exception:
             _log.debug("telemetry flush failed", exc_info=True)

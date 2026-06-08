@@ -61,6 +61,9 @@ class APIStatusError(RelayError):
         self.error_type = error_type
         self.error_code = error_code
         self.body = body or {}
+        # Strip auth header to prevent credential leaks via error reporters
+        if hasattr(response, "request") and response.request is not None:
+            response.request.headers.pop("authorization", None)
         self.response = response
 
     def __repr__(self) -> str:
@@ -149,7 +152,7 @@ def _raise_for_status(response: httpx.Response) -> None:
                 error_type = err.get("type")
                 error_code = err.get("code")
         except (ValueError, TypeError):
-            message = raw_text[:500]
+            message = f"HTTP {response.status_code} (non-JSON response)"
 
     kwargs: dict[str, Any] = {
         "status_code": response.status_code,

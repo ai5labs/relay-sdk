@@ -2,13 +2,14 @@
 
 Install with::
 
-    pip install ai5labs-relay[otel]
+    pip install relay-ai-sdk[otel]
 
 Provides ``instrument()`` to wrap a client with GenAI semantic-convention
 spans, and ``RelaySpanExporter`` to forward metadata-only span data to
 the Relay ``/v1/logs`` endpoint.
 
-**Privacy**: no content attributes are ever set on spans.
+**Privacy**: no content attributes are ever set on spans.  ``record_exception``
+is intentionally omitted — error messages may echo user content.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ except ImportError:
     pass
 
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+_MODEL_OPERATIONS = frozenset({"chat", "images.generate", "audio.transcribe", "audio.speech"})
 
 
 # ------------------------------------------------------------------
@@ -50,7 +53,7 @@ def instrument(
         import warnings
 
         warnings.warn(
-            "opentelemetry is not installed — pip install ai5labs-relay[otel]",
+            "opentelemetry is not installed — pip install relay-ai-sdk[otel]",
             stacklevel=2,
         )
         return client
@@ -68,6 +71,9 @@ def instrument(
         ("transcribe", "audio.transcribe"),
         ("speech", "audio.speech"),
         ("route", "route"),
+        ("batch", "batch"),
+        ("credits", "billing.credits"),
+        ("models", "models.list"),
     ):
         original = getattr(client, method_name, None)
         if original is None:
@@ -102,6 +108,7 @@ if _HAS_OTEL:
                 "gen_ai.request.temperature",
                 "gen_ai.usage.input_tokens",
                 "gen_ai.usage.output_tokens",
+                "gen_ai.response.model",
                 "gen_ai.response.finish_reasons",
                 "gen_ai.client.latency_ms",
                 "error.type",
@@ -111,10 +118,12 @@ if _HAS_OTEL:
         def __init__(self, api_key: str, base_url: str) -> None:
             self._api_key = api_key
             self._url = base_url.rstrip("/") + "/logs"
+            self._http = httpx.Client(
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=10.0,
+            )
 
         def export(self, spans: Any) -> SpanExportResult:
-            import httpx as _httpx
-
             events: list[dict[str, Any]] = []
             for span in spans:
                 attrs = {
@@ -140,62 +149,78 @@ if _HAS_OTEL:
             if not events:
                 return SpanExportResult.SUCCESS
             try:
-                _httpx.post(
-                    self._url,
-                    headers={"Authorization": f"Bearer {self._api_key}"},
-                    json={"events": events},
-                    timeout=10.0,
-                )
+                self._http.post(self._url, json={"events": events})
                 return SpanExportResult.SUCCESS
             except Exception:
                 return SpanExportResult.FAILURE
 
         def shutdown(self) -> None:
-            pass
+            try:
+                self._http.close()
+            except Exception:
+                pass
 
         def force_flush(self, timeout_millis: int = 30_000) -> bool:
             return True
 
 
 # ------------------------------------------------------------------
-# Internal wrapping helpers
+# Internal helpers
 # ------------------------------------------------------------------
 
+import httpx  # noqa: E402 — needed by RelaySpanExporter above
 
-def _set_request_attrs(span: Any, model: str, kwargs: dict[str, Any]) -> None:
+
+def _extract_model(operation: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    """Extract the model string from call args, handling route() specially."""
+    if operation not in _MODEL_OPERATIONS:
+        return operation
+    return str(args[0]) if args else str(kwargs.get("model", "unknown"))
+
+
+def _set_request_attrs(span: Any, model: str, operation: str, kwargs: dict[str, Any]) -> None:
     span.set_attribute("gen_ai.system", "relay")
     span.set_attribute("gen_ai.request.model", model)
     if (mt := kwargs.get("max_tokens")) is not None:
         span.set_attribute("gen_ai.request.max_tokens", mt)
     if (temp := kwargs.get("temperature")) is not None:
         span.set_attribute("gen_ai.request.temperature", temp)
+    if (tp := kwargs.get("top_p")) is not None:
+        span.set_attribute("gen_ai.request.top_p", tp)
 
 
 def _set_response_attrs(span: Any, result: Any) -> None:
     if hasattr(result, "usage") and result.usage:
         span.set_attribute("gen_ai.usage.input_tokens", result.usage.prompt_tokens)
         span.set_attribute("gen_ai.usage.output_tokens", result.usage.completion_tokens)
+    if hasattr(result, "model") and result.model:
+        span.set_attribute("gen_ai.response.model", result.model)
     if hasattr(result, "finish_reason") and result.finish_reason:
         span.set_attribute("gen_ai.response.finish_reasons", [result.finish_reason])
     if hasattr(result, "latency_ms"):
         span.set_attribute("gen_ai.client.latency_ms", result.latency_ms)
+    if hasattr(result, "raw") and isinstance(result.raw, dict):
+        resp_id = result.raw.get("id")
+        if resp_id:
+            span.set_attribute("gen_ai.response.id", resp_id)
 
 
 def _wrap_sync(original: _F, tracer: Any, operation: str) -> _F:
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        model = args[0] if args else kwargs.get("model", "unknown")
+        model = _extract_model(operation, args, kwargs)
         with tracer.start_as_current_span(f"relay.{operation}") as span:
             span.set_attribute("gen_ai.operation.name", operation)
-            _set_request_attrs(span, str(model), kwargs)
+            _set_request_attrs(span, model, operation, kwargs)
             try:
                 result = original(*args, **kwargs)
                 if not kwargs.get("stream"):
                     _set_response_attrs(span, result)
                 return result
             except Exception as exc:
-                span.record_exception(exc)
                 span.set_attribute("error.type", type(exc).__name__)
+                if hasattr(exc, "error_code") and exc.error_code:
+                    span.set_attribute("error.code", exc.error_code)
                 raise
 
     return wrapper  # type: ignore[return-value]
@@ -204,18 +229,19 @@ def _wrap_sync(original: _F, tracer: Any, operation: str) -> _F:
 def _wrap_async(original: _F, tracer: Any, operation: str) -> _F:
     @functools.wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        model = args[0] if args else kwargs.get("model", "unknown")
+        model = _extract_model(operation, args, kwargs)
         with tracer.start_as_current_span(f"relay.{operation}") as span:
             span.set_attribute("gen_ai.operation.name", operation)
-            _set_request_attrs(span, str(model), kwargs)
+            _set_request_attrs(span, model, operation, kwargs)
             try:
                 result = await original(*args, **kwargs)
                 if not kwargs.get("stream"):
                     _set_response_attrs(span, result)
                 return result
             except Exception as exc:
-                span.record_exception(exc)
                 span.set_attribute("error.type", type(exc).__name__)
+                if hasattr(exc, "error_code") and exc.error_code:
+                    span.set_attribute("error.code", exc.error_code)
                 raise
 
     return wrapper  # type: ignore[return-value]

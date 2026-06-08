@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 
+from relay_ai._errors import APIStatusError
 from relay_ai._types import BatchResult
 
 if TYPE_CHECKING:
@@ -26,6 +27,10 @@ def batch_sync(
         try:
             resp = client.chat(model, **req)
             return BatchResult(index=idx, response=resp)  # type: ignore[arg-type]
+        except APIStatusError as exc:
+            return BatchResult(
+                index=idx, error=str(exc), status_code=exc.status_code, error_code=exc.error_code,
+            )
         except Exception as exc:
             return BatchResult(index=idx, error=str(exc))
 
@@ -54,6 +59,10 @@ async def batch_async(
             try:
                 resp = await client.chat(model, **req)
                 return BatchResult(index=idx, response=resp)  # type: ignore[arg-type]
+            except APIStatusError as exc:
+                return BatchResult(
+                    index=idx, error=str(exc), status_code=exc.status_code, error_code=exc.error_code,
+                )
             except Exception as exc:
                 return BatchResult(index=idx, error=str(exc))
 

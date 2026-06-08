@@ -8,6 +8,7 @@ automatic retries, typed errors, streaming context managers, custom
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import time
@@ -18,7 +19,9 @@ import httpx
 
 from relay_ai._errors import (
     APIConnectionError,
+    APIStatusError,
     APITimeoutError,
+    RelayError,
     _raise_for_status,
 )
 from relay_ai._streaming import AsyncStream, Stream
@@ -36,6 +39,8 @@ from relay_ai._types import (
     Usage,
 )
 from relay_ai._version import __version__
+
+_log = logging.getLogger("relay_ai")
 
 BASE_URL = "https://api.relay.ai5labs.com/v1"
 
@@ -165,11 +170,19 @@ def _emit_telemetry(
     if result is not None:
         event["input_tokens"] = result.usage.prompt_tokens
         event["output_tokens"] = result.usage.completion_tokens
+        if result.usage.cached_tokens:
+            event["cached_tokens"] = result.usage.cached_tokens
         if result.finish_reason:
             event["finish_reason"] = result.finish_reason
     if error_code:
         event["error_code"] = error_code
     sink.emit(event)
+
+
+def _error_code_from(exc: Exception) -> str:
+    if isinstance(exc, APIStatusError):
+        return exc.error_code or type(exc).__name__
+    return type(exc).__name__
 
 
 # ===================================================================
@@ -250,7 +263,11 @@ class Relay:
             return Stream(resp, model, telemetry=self._telemetry)
 
         t0 = time.monotonic()
-        resp = self._request("POST", "/chat/completions", json=body)
+        try:
+            resp = self._request("POST", "/chat/completions", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         latency_ms = (time.monotonic() - t0) * 1000
         result = _parse_chat(resp.json())
         result.latency_ms = latency_ms
@@ -276,12 +293,16 @@ class Relay:
             **kwargs,
         }
         t0 = time.monotonic()
-        resp = self._request("POST", "/images/generations", json=body)
+        try:
+            resp = self._request("POST", "/images/generations", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         latency_ms = (time.monotonic() - t0) * 1000
         data = resp.json()
         urls = [img.get("url", "") for img in data.get("data", [])]
         _emit_telemetry(self._telemetry, model, None, latency_ms)
-        return ImageResponse(images=urls, model=model, raw=data)
+        return ImageResponse(images=urls, model=model, latency_ms=latency_ms, raw=data)
 
     # ---- audio ------------------------------------------------------
 
@@ -310,6 +331,9 @@ class Relay:
                 files={"file": (filename, file_obj)},
                 data=form,
             )
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         finally:
             if should_close:
                 file_obj.close()
@@ -340,7 +364,11 @@ class Relay:
             **kwargs,
         }
         t0 = time.monotonic()
-        resp = self._request("POST", "/audio/speech", json=body)
+        try:
+            resp = self._request("POST", "/audio/speech", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         latency_ms = (time.monotonic() - t0) * 1000
         ct = resp.headers.get("content-type", f"audio/{response_format}")
         _emit_telemetry(self._telemetry, model, None, latency_ms)
@@ -369,26 +397,35 @@ class Relay:
             body["constraints"] = constraints
         body.update(kwargs)
 
-        resp = self._request("POST", "/route", json=body)
+        t0 = time.monotonic()
+        try:
+            resp = self._request("POST", "/route", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, "route", None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
+        latency_ms = (time.monotonic() - t0) * 1000
         data = resp.json()
         alternates = [
             RouteAlternate(alias=a[0], confidence=a[1])
             for a in data.get("alternates", [])
         ]
+        alias = data.get("alias", "")
+        _emit_telemetry(self._telemetry, alias or "route", None, latency_ms)
         return RouteResponse(
-            alias=data.get("alias", ""),
+            alias=alias,
             confidence=data.get("confidence", 0.0),
             reasoning=data.get("reasoning", ""),
             alternates=alternates,
             classified_intent=data.get("classified_intent", ""),
             source=data.get("source", ""),
+            latency_ms=latency_ms,
             raw=data,
         )
 
     # ---- billing ----------------------------------------------------
 
     def credits(self) -> CreditState:
-        resp = self._request("POST", "/billing/credits:state", json={})
+        resp = self._request("GET", "/billing/credits/state")
         data = resp.json()
         return CreditState(
             balance_cents=data.get("balance_cents", 0),
@@ -443,24 +480,29 @@ class Relay:
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    time.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (timeout)", attempt + 1, self.max_retries, delay)
+                    time.sleep(delay)
                     continue
                 raise APITimeoutError(request=exc.request) from exc
             except httpx.ConnectError as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    time.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (connect error)", attempt + 1, self.max_retries, delay)
+                    time.sleep(delay)
                     continue
                 raise APIConnectionError(message=str(exc), request=exc.request) from exc
 
             if resp.status_code in _RETRY_STATUS_CODES and attempt < self.max_retries:
-                time.sleep(_retry_delay(attempt, resp))
+                delay = _retry_delay(attempt, resp)
+                _log.debug("retry %d/%d after %.1fs (HTTP %d)", attempt + 1, self.max_retries, delay, resp.status_code)
+                time.sleep(delay)
                 continue
 
             _raise_for_status(resp)
             return resp
 
-        # Exhausted retries on a transport error
         if isinstance(last_exc, httpx.TimeoutException):
             raise APITimeoutError(request=last_exc.request) from last_exc
         raise APIConnectionError(
@@ -479,18 +521,23 @@ class Relay:
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    time.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (timeout)", attempt + 1, self.max_retries, delay)
+                    time.sleep(delay)
                     continue
                 raise APITimeoutError(request=exc.request) from exc
             except httpx.ConnectError as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    time.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (connect error)", attempt + 1, self.max_retries, delay)
+                    time.sleep(delay)
                     continue
                 raise APIConnectionError(message=str(exc), request=exc.request) from exc
 
             if resp.status_code in _RETRY_STATUS_CODES and attempt < self.max_retries:
                 delay = _retry_delay(attempt, resp)
+                _log.debug("retry %d/%d after %.1fs (HTTP %d)", attempt + 1, self.max_retries, delay, resp.status_code)
                 resp.close()
                 time.sleep(delay)
                 continue
@@ -592,7 +639,11 @@ class AsyncRelay:
             return AsyncStream(resp, model, telemetry=self._telemetry)
 
         t0 = time.monotonic()
-        resp = await self._request("POST", "/chat/completions", json=body)
+        try:
+            resp = await self._request("POST", "/chat/completions", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         latency_ms = (time.monotonic() - t0) * 1000
         result = _parse_chat(resp.json())
         result.latency_ms = latency_ms
@@ -618,12 +669,16 @@ class AsyncRelay:
             **kwargs,
         }
         t0 = time.monotonic()
-        resp = await self._request("POST", "/images/generations", json=body)
+        try:
+            resp = await self._request("POST", "/images/generations", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         latency_ms = (time.monotonic() - t0) * 1000
         data = resp.json()
         urls = [img.get("url", "") for img in data.get("data", [])]
         _emit_telemetry(self._telemetry, model, None, latency_ms)
-        return ImageResponse(images=urls, model=model, raw=data)
+        return ImageResponse(images=urls, model=model, latency_ms=latency_ms, raw=data)
 
     # ---- audio ------------------------------------------------------
 
@@ -652,6 +707,9 @@ class AsyncRelay:
                 files={"file": (filename, file_obj)},
                 data=form,
             )
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         finally:
             if should_close:
                 file_obj.close()
@@ -682,7 +740,11 @@ class AsyncRelay:
             **kwargs,
         }
         t0 = time.monotonic()
-        resp = await self._request("POST", "/audio/speech", json=body)
+        try:
+            resp = await self._request("POST", "/audio/speech", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, model, None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
         latency_ms = (time.monotonic() - t0) * 1000
         ct = resp.headers.get("content-type", f"audio/{response_format}")
         _emit_telemetry(self._telemetry, model, None, latency_ms)
@@ -711,26 +773,35 @@ class AsyncRelay:
             body["constraints"] = constraints
         body.update(kwargs)
 
-        resp = await self._request("POST", "/route", json=body)
+        t0 = time.monotonic()
+        try:
+            resp = await self._request("POST", "/route", json=body)
+        except RelayError as exc:
+            _emit_telemetry(self._telemetry, "route", None, (time.monotonic() - t0) * 1000, error_code=_error_code_from(exc))
+            raise
+        latency_ms = (time.monotonic() - t0) * 1000
         data = resp.json()
         alternates = [
             RouteAlternate(alias=a[0], confidence=a[1])
             for a in data.get("alternates", [])
         ]
+        alias = data.get("alias", "")
+        _emit_telemetry(self._telemetry, alias or "route", None, latency_ms)
         return RouteResponse(
-            alias=data.get("alias", ""),
+            alias=alias,
             confidence=data.get("confidence", 0.0),
             reasoning=data.get("reasoning", ""),
             alternates=alternates,
             classified_intent=data.get("classified_intent", ""),
             source=data.get("source", ""),
+            latency_ms=latency_ms,
             raw=data,
         )
 
     # ---- billing ----------------------------------------------------
 
     async def credits(self) -> CreditState:
-        resp = await self._request("POST", "/billing/credits:state", json={})
+        resp = await self._request("GET", "/billing/credits/state")
         data = resp.json()
         return CreditState(
             balance_cents=data.get("balance_cents", 0),
@@ -784,18 +855,24 @@ class AsyncRelay:
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    await asyncio.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (timeout)", attempt + 1, self.max_retries, delay)
+                    await asyncio.sleep(delay)
                     continue
                 raise APITimeoutError(request=exc.request) from exc
             except httpx.ConnectError as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    await asyncio.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (connect error)", attempt + 1, self.max_retries, delay)
+                    await asyncio.sleep(delay)
                     continue
                 raise APIConnectionError(message=str(exc), request=exc.request) from exc
 
             if resp.status_code in _RETRY_STATUS_CODES and attempt < self.max_retries:
-                await asyncio.sleep(_retry_delay(attempt, resp))
+                delay = _retry_delay(attempt, resp)
+                _log.debug("retry %d/%d after %.1fs (HTTP %d)", attempt + 1, self.max_retries, delay, resp.status_code)
+                await asyncio.sleep(delay)
                 continue
 
             _raise_for_status(resp)
@@ -818,18 +895,23 @@ class AsyncRelay:
             except httpx.TimeoutException as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    await asyncio.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (timeout)", attempt + 1, self.max_retries, delay)
+                    await asyncio.sleep(delay)
                     continue
                 raise APITimeoutError(request=exc.request) from exc
             except httpx.ConnectError as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
-                    await asyncio.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt)
+                    _log.debug("retry %d/%d after %.1fs (connect error)", attempt + 1, self.max_retries, delay)
+                    await asyncio.sleep(delay)
                     continue
                 raise APIConnectionError(message=str(exc), request=exc.request) from exc
 
             if resp.status_code in _RETRY_STATUS_CODES and attempt < self.max_retries:
                 delay = _retry_delay(attempt, resp)
+                _log.debug("retry %d/%d after %.1fs (HTTP %d)", attempt + 1, self.max_retries, delay, resp.status_code)
                 await resp.aclose()
                 await asyncio.sleep(delay)
                 continue

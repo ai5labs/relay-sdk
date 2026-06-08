@@ -7,6 +7,7 @@ parse SSE frames, accumulate the final response, and emit telemetry on close.
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator
 
 import httpx
@@ -102,6 +103,7 @@ class _Accumulator:
         self.finish_reason: str | None = None
         self.usage: Usage | None = None
         self.tool_calls: dict[int, dict[str, str]] = {}
+        self.error: str | None = None
 
     def feed(self, chunk: StreamChunk) -> None:
         if chunk.text:
@@ -148,6 +150,9 @@ def _emit(
     model: str,
     usage: Usage | None,
     finish_reason: str | None,
+    latency_ms: float | None,
+    *,
+    error_code: str | None = None,
 ) -> None:
     if sink is None:
         return
@@ -161,8 +166,14 @@ def _emit(
     if usage:
         event["input_tokens"] = usage.prompt_tokens
         event["output_tokens"] = usage.completion_tokens
+        if usage.cached_tokens:
+            event["cached_tokens"] = usage.cached_tokens
     if finish_reason:
         event["finish_reason"] = finish_reason
+    if latency_ms is not None:
+        event["latency_ms"] = round(latency_ms, 1)
+    if error_code:
+        event["error_code"] = error_code
     sink.emit(event)
 
 
@@ -193,6 +204,7 @@ class Stream:
         self._acc = _Accumulator(model)
         self._telemetry = telemetry
         self._done = False
+        self._t0 = time.monotonic()
 
     def __enter__(self) -> Stream:
         return self
@@ -201,19 +213,22 @@ class Stream:
         self.close()
 
     def __iter__(self) -> Iterator[StreamChunk]:
-        buffer = ""
-        for text in self._response.iter_text():
-            buffer += text
-            while "\n\n" in buffer:
-                frame, buffer = buffer.split("\n\n", 1)
-                for chunk in _parse_sse_frame(frame):
+        try:
+            buffer = ""
+            for text in self._response.iter_text():
+                buffer += text
+                while "\n\n" in buffer:
+                    frame, buffer = buffer.split("\n\n", 1)
+                    for chunk in _parse_sse_frame(frame):
+                        self._acc.feed(chunk)
+                        yield chunk
+            if buffer.strip():
+                for chunk in _parse_sse_frame(buffer):
                     self._acc.feed(chunk)
                     yield chunk
-        # Flush any trailing frame not terminated by \n\n
-        if buffer.strip():
-            for chunk in _parse_sse_frame(buffer):
-                self._acc.feed(chunk)
-                yield chunk
+        except Exception as exc:
+            self._acc.error = type(exc).__name__
+            raise
 
     def get_final_response(self) -> ChatResponse:
         """Return the accumulated ``ChatResponse`` after iteration."""
@@ -222,13 +237,23 @@ class Stream:
     def close(self) -> None:
         if not self._done:
             self._done = True
+            latency_ms = (time.monotonic() - self._t0) * 1000
             _emit(
                 self._telemetry,
                 self._acc.model,
                 self._acc.usage,
                 self._acc.finish_reason,
+                latency_ms,
+                error_code=self._acc.error,
             )
             self._response.close()
+
+    def __del__(self) -> None:
+        if not self._done:
+            try:
+                self.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +283,7 @@ class AsyncStream:
         self._acc = _Accumulator(model)
         self._telemetry = telemetry
         self._done = False
+        self._t0 = time.monotonic()
 
     async def __aenter__(self) -> AsyncStream:
         return self
@@ -266,19 +292,22 @@ class AsyncStream:
         await self.close()
 
     async def __aiter__(self) -> AsyncIterator[StreamChunk]:
-        buffer = ""
-        async for text in self._response.aiter_text():
-            buffer += text
-            while "\n\n" in buffer:
-                frame, buffer = buffer.split("\n\n", 1)
-                for chunk in _parse_sse_frame(frame):
+        try:
+            buffer = ""
+            async for text in self._response.aiter_text():
+                buffer += text
+                while "\n\n" in buffer:
+                    frame, buffer = buffer.split("\n\n", 1)
+                    for chunk in _parse_sse_frame(frame):
+                        self._acc.feed(chunk)
+                        yield chunk
+            if buffer.strip():
+                for chunk in _parse_sse_frame(buffer):
                     self._acc.feed(chunk)
                     yield chunk
-        # Flush any trailing frame not terminated by \n\n
-        if buffer.strip():
-            for chunk in _parse_sse_frame(buffer):
-                self._acc.feed(chunk)
-                yield chunk
+        except Exception as exc:
+            self._acc.error = type(exc).__name__
+            raise
 
     def get_final_response(self) -> ChatResponse:
         """Return the accumulated ``ChatResponse`` after iteration."""
@@ -287,10 +316,13 @@ class AsyncStream:
     async def close(self) -> None:
         if not self._done:
             self._done = True
+            latency_ms = (time.monotonic() - self._t0) * 1000
             _emit(
                 self._telemetry,
                 self._acc.model,
                 self._acc.usage,
                 self._acc.finish_reason,
+                latency_ms,
+                error_code=self._acc.error,
             )
             await self._response.aclose()
